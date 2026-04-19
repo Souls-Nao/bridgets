@@ -23,7 +23,7 @@ from conexion import Base, engine, get_db
 # Idempotente: crea las tablas faltantes sin tocar las existentes.
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Bridgets API", version="0.4.0")
+app = FastAPI(title="Bridgets API", version="0.5.0")
 
 # CORS abierto: el cliente de escritorio no envía Origin típico pero facilita
 # pruebas desde navegador (Swagger UI y /docs). En producción estricta se
@@ -230,3 +230,161 @@ def actualizar_usuario(
         raise HTTPException(status_code=409, detail="violación de unicidad al actualizar")
     db.refresh(usuario)
     return usuario
+
+
+# ---------- Clases e inscripciones ----------
+
+
+@app.post(
+    "/clases/",
+    response_model=schemas.ClaseOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def crear_clase(
+    datos: schemas.ClaseCreate, db: Session = Depends(get_db)
+) -> modelos.Clase:
+    """Crea una clase para un tutor existente. Genera codigo_acceso único."""
+    tutor = db.get(modelos.Usuario, datos.tutor_id)
+    if tutor is None:
+        raise HTTPException(status_code=404, detail="tutor no encontrado")
+    if tutor.rol != "tutor":
+        raise HTTPException(
+            status_code=403, detail="solo un usuario con rol tutor puede crear clases"
+        )
+
+    clase = modelos.Clase(
+        nombre=datos.nombre,
+        descripcion=datos.descripcion,
+        horario=datos.horario,
+        color_hex=datos.color_hex,
+        tutor_id=datos.tutor_id,
+        codigo_acceso=seguridad.generar_codigo_acceso(db),
+    )
+    db.add(clase)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Race: otro insert tomó el mismo codigo_acceso entre generar y commit.
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="colisión al asignar codigo_acceso; reintenta"
+        )
+    db.refresh(clase)
+    return clase
+
+
+@app.get("/clases/usuario/{usuario_id}", response_model=list[schemas.ClaseOut])
+def listar_clases_usuario(
+    usuario_id: int, db: Session = Depends(get_db)
+) -> list[modelos.Clase]:
+    """
+    Devuelve las clases asociadas al usuario según su rol:
+    - tutor: clases que dicta.
+    - estudiante: clases en las que está inscrito.
+    """
+    usuario = db.get(modelos.Usuario, usuario_id)
+    if usuario is None:
+        raise HTTPException(status_code=404, detail="usuario no encontrado")
+
+    if usuario.rol == "tutor":
+        return (
+            db.query(modelos.Clase)
+            .filter(modelos.Clase.tutor_id == usuario_id)
+            .order_by(modelos.Clase.id)
+            .all()
+        )
+
+    # Estudiante: join con inscripciones.
+    return (
+        db.query(modelos.Clase)
+        .join(modelos.Inscripcion, modelos.Inscripcion.clase_id == modelos.Clase.id)
+        .filter(modelos.Inscripcion.estudiante_id == usuario_id)
+        .order_by(modelos.Clase.id)
+        .all()
+    )
+
+
+@app.post(
+    "/clases/inscribir/",
+    status_code=status.HTTP_201_CREATED,
+)
+def inscribir_estudiante(
+    datos: schemas.InscripcionRequest, db: Session = Depends(get_db)
+) -> dict:
+    """
+    Inscribe un estudiante en una clase usando codigo_acceso.
+
+    El código se compara en mayúsculas por robustez ante el input del cliente.
+    """
+    estudiante = db.get(modelos.Usuario, datos.estudiante_id)
+    if estudiante is None:
+        raise HTTPException(status_code=404, detail="estudiante no encontrado")
+    if estudiante.rol != "estudiante":
+        raise HTTPException(
+            status_code=403, detail="solo un usuario con rol estudiante puede inscribirse"
+        )
+
+    codigo_norm = datos.codigo_acceso.strip().upper()
+    clase = (
+        db.query(modelos.Clase)
+        .filter(modelos.Clase.codigo_acceso == codigo_norm)
+        .first()
+    )
+    if clase is None:
+        raise HTTPException(status_code=404, detail="codigo_acceso inválido")
+
+    inscripcion = modelos.Inscripcion(
+        estudiante_id=datos.estudiante_id, clase_id=clase.id
+    )
+    db.add(inscripcion)
+    try:
+        db.commit()
+    except IntegrityError:
+        # UniqueConstraint(estudiante_id, clase_id) dispara si ya está inscrito.
+        db.rollback()
+        raise HTTPException(status_code=409, detail="estudiante ya inscrito en la clase")
+    db.refresh(inscripcion)
+    return {
+        "id": inscripcion.id,
+        "estudiante_id": inscripcion.estudiante_id,
+        "clase_id": inscripcion.clase_id,
+    }
+
+
+@app.get("/clases/buscar/", response_model=list[schemas.ClaseOut])
+def buscar_clases(
+    q: str, estudiante_id: int, db: Session = Depends(get_db)
+) -> list[modelos.Clase]:
+    """
+    Busca clases por nombre o descripción (ILIKE), excluyendo las que el
+    estudiante ya tiene inscritas. Exige q con al menos 2 caracteres para
+    evitar devolver el catálogo completo por error.
+    """
+    q_limpio = q.strip()
+    if len(q_limpio) < 2:
+        return []
+
+    estudiante = db.get(modelos.Usuario, estudiante_id)
+    if estudiante is None:
+        raise HTTPException(status_code=404, detail="estudiante no encontrado")
+
+    # Subquery: clase_ids donde el estudiante ya está inscrito.
+    ya_inscritas = (
+        db.query(modelos.Inscripcion.clase_id)
+        .filter(modelos.Inscripcion.estudiante_id == estudiante_id)
+        .subquery()
+    )
+
+    patron = f"%{q_limpio}%"
+    return (
+        db.query(modelos.Clase)
+        .filter(
+            or_(
+                modelos.Clase.nombre.ilike(patron),
+                modelos.Clase.descripcion.ilike(patron),
+            ),
+            ~modelos.Clase.id.in_(ya_inscritas.select()),
+        )
+        .order_by(modelos.Clase.id)
+        .all()
+    )
