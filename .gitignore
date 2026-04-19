@@ -1,0 +1,30 @@
+# Secretos y especificación interna
+.env
+SPEC.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.exe
+*.spec.bak
+
+# IDEs y herramientas locales
+.idea/
+.vscode/
+*.swp
+.claude/settings.local.json
+
+# SO
+.DS_Store
+Thumbs.db
