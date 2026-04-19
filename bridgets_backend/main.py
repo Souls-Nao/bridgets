@@ -23,7 +23,7 @@ from conexion import Base, engine, get_db
 # Idempotente: crea las tablas faltantes sin tocar las existentes.
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Bridgets API", version="0.5.0")
+app = FastAPI(title="Bridgets API", version="0.6.0")
 
 # CORS abierto: el cliente de escritorio no envía Origin típico pero facilita
 # pruebas desde navegador (Swagger UI y /docs). En producción estricta se
@@ -386,5 +386,109 @@ def buscar_clases(
             ~modelos.Clase.id.in_(ya_inscritas.select()),
         )
         .order_by(modelos.Clase.id)
+        .all()
+    )
+
+
+# ---------- Anuncios ----------
+
+
+@app.get(
+    "/clases/{clase_id}/anuncios/", response_model=list[schemas.AnuncioOut]
+)
+def listar_anuncios(
+    clase_id: int, db: Session = Depends(get_db)
+) -> list[modelos.Anuncio]:
+    """Lista los anuncios de una clase, del más reciente al más antiguo."""
+    clase = db.get(modelos.Clase, clase_id)
+    if clase is None:
+        raise HTTPException(status_code=404, detail="clase no encontrada")
+    return (
+        db.query(modelos.Anuncio)
+        .filter(modelos.Anuncio.clase_id == clase_id)
+        .order_by(modelos.Anuncio.fecha_creacion.desc())
+        .all()
+    )
+
+
+@app.post(
+    "/clases/{clase_id}/anuncios/",
+    response_model=schemas.AnuncioOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def crear_anuncio(
+    clase_id: int,
+    datos: schemas.AnuncioCreate,
+    db: Session = Depends(get_db),
+) -> modelos.Anuncio:
+    """
+    Crea un anuncio en la clase.
+
+    Sin restricción de rol: la UX del cliente decide quién ve el botón de
+    crear. Si el producto requiere que solo el tutor publique, se agrega
+    la guardia aquí.
+    """
+    clase = db.get(modelos.Clase, clase_id)
+    if clase is None:
+        raise HTTPException(status_code=404, detail="clase no encontrada")
+
+    anuncio = modelos.Anuncio(contenido=datos.contenido, clase_id=clase_id)
+    db.add(anuncio)
+    db.commit()
+    db.refresh(anuncio)
+    return anuncio
+
+
+# ---------- Notas ----------
+
+
+@app.post(
+    "/notas/",
+    response_model=schemas.NotaOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def guardar_nota(
+    datos: schemas.NotaCreate, db: Session = Depends(get_db)
+) -> modelos.Nota:
+    """
+    Guarda una nota con contenido_formato (texto + tags de formato) en JSON.
+
+    clase_id es opcional: una nota puede ser personal y no asociarse a una clase.
+    """
+    estudiante = db.get(modelos.Usuario, datos.estudiante_id)
+    if estudiante is None:
+        raise HTTPException(status_code=404, detail="estudiante no encontrado")
+
+    if datos.clase_id is not None:
+        clase = db.get(modelos.Clase, datos.clase_id)
+        if clase is None:
+            raise HTTPException(status_code=400, detail="clase_id no corresponde a ninguna clase")
+
+    nota = modelos.Nota(
+        titulo=datos.titulo,
+        # Pydantic convierte ContenidoFormato a dict al serializar para SQLAlchemy.
+        contenido_formato=datos.contenido_formato.model_dump(),
+        estudiante_id=datos.estudiante_id,
+        clase_id=datos.clase_id,
+    )
+    db.add(nota)
+    db.commit()
+    db.refresh(nota)
+    return nota
+
+
+@app.get("/notas/usuario/{usuario_id}", response_model=list[schemas.NotaOut])
+def listar_notas_usuario(
+    usuario_id: int, db: Session = Depends(get_db)
+) -> list[modelos.Nota]:
+    """Lista las notas de un usuario, del más reciente al más antiguo."""
+    usuario = db.get(modelos.Usuario, usuario_id)
+    if usuario is None:
+        raise HTTPException(status_code=404, detail="usuario no encontrado")
+
+    return (
+        db.query(modelos.Nota)
+        .filter(modelos.Nota.estudiante_id == usuario_id)
+        .order_by(modelos.Nota.fecha_creacion.desc())
         .all()
     )
