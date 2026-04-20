@@ -23,7 +23,7 @@ dist/
 .idea/
 .vscode/
 *.swp
-.claude/settings.local.json
+.claude/
 
 # SO
 .DS_Store
